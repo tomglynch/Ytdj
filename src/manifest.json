@@ -15,8 +15,7 @@
     "https://music.youtube.com/*"
   ],
   "background": {
-    "service_worker": "background.js",
-    "type": "module"
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
@@ -33,7 +32,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["controller.html"],
+      "resources": ["controller.html", "offscreen.html"],
       "matches": ["<all_urls>"]
     }
   ]

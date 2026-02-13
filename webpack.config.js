@@ -7,6 +7,7 @@ module.exports = {
     background: './src/background/index.ts',
     content: './src/content/index.ts',
     controller: './src/controller/index.ts',
+    offscreen: './src/offscreen/index.ts',
   },
   output: {
     path: path.resolve(__dirname, 'dist'),
@@ -28,16 +29,12 @@ module.exports = {
   },
   resolve: {
     extensions: ['.ts', '.js'],
-    fallback: {
-      fs: false,
-      path: false,
-      crypto: false,
-    },
   },
   plugins: [
     new CopyWebpackPlugin({
       patterns: [
         { from: 'src/manifest.json', to: 'manifest.json' },
+        { from: 'src/offscreen/offscreen.html', to: 'offscreen.html' },
         { from: 'src/icons', to: 'icons', noErrorOnMissing: true },
       ],
     }),

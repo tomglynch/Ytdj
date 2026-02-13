@@ -1,26 +1,30 @@
 /**
  * Content script injected into YouTube tabs.
+ *
  * Responsibilities:
  * 1. Capture audio from the YouTube player via Web Audio API
- * 2. Relay playback control commands to the YouTube player
- * 3. Report player state back to the background script
+ * 2. Accumulate audio samples into a buffer for analysis
+ * 3. Relay playback control commands to the YouTube player
+ * 4. Report player state back to the background script
  */
 
 import { ContentMessage, ContentResponse } from '../types';
 
 let audioContext: AudioContext | null = null;
 let mediaSource: MediaElementAudioSourceNode | null = null;
-let analyserNode: AnalyserNode | null = null;
-let gainNode: GainNode | null = null;
+let scriptNode: ScriptProcessorNode | null = null;
 let isCapturing = false;
 let statePollingInterval: ReturnType<typeof setInterval> | null = null;
 
+// Audio accumulation buffer for analysis
+let audioChunks: Float32Array[] = [];
+let totalSamplesCollected = 0;
+const TARGET_DURATION_SECONDS = 30; // Capture 30s for analysis
+
 /** Find the YouTube video element on the page */
 function getVideoElement(): HTMLVideoElement | null {
-  // Main YouTube player
-  const video = document.querySelector('video.html5-main-video') as HTMLVideoElement
+  return document.querySelector('video.html5-main-video') as HTMLVideoElement
     ?? document.querySelector('video') as HTMLVideoElement;
-  return video;
 }
 
 /** Extract current player state from the DOM video element */
@@ -30,11 +34,9 @@ function getPlayerState(): ContentResponse | null {
     return { type: 'ERROR', message: 'No video element found' };
   }
 
-  // Extract video ID from URL
   const urlParams = new URLSearchParams(window.location.search);
   const videoId = urlParams.get('v') || '';
 
-  // Extract title
   const titleEl = document.querySelector('h1.ytd-watch-metadata yt-formatted-string')
     ?? document.querySelector('#title h1');
   const title = titleEl?.textContent?.trim() || document.title;
@@ -57,22 +59,50 @@ function setupAudioCapture(): boolean {
   if (!video) return false;
 
   if (audioContext && mediaSource) {
-    // Already set up
-    return true;
+    return true; // Already set up
   }
 
   try {
     audioContext = new AudioContext();
     mediaSource = audioContext.createMediaElementSource(video);
-    analyserNode = audioContext.createAnalyser();
-    analyserNode.fftSize = 2048;
-    gainNode = audioContext.createGain();
 
-    // Route: video -> analyser -> gain -> destination
-    // This lets us analyze audio while still hearing it
-    mediaSource.connect(analyserNode);
-    analyserNode.connect(gainNode);
-    gainNode.connect(audioContext.destination);
+    // ScriptProcessorNode captures raw PCM samples.
+    // We accumulate chunks locally and send the whole buffer once ready.
+    const bufferSize = 4096;
+    scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+    // Route: video -> scriptNode -> destination (audio still plays)
+    mediaSource.connect(scriptNode);
+    scriptNode.connect(audioContext.destination);
+
+    scriptNode.onaudioprocess = (e) => {
+      if (!isCapturing) return;
+
+      const inputData = e.inputBuffer.getChannelData(0);
+      const sampleRate = audioContext!.sampleRate;
+      const targetSamples = TARGET_DURATION_SECONDS * sampleRate;
+
+      if (totalSamplesCollected < targetSamples) {
+        const chunk = new Float32Array(inputData);
+        audioChunks.push(chunk);
+        totalSamplesCollected += chunk.length;
+
+        // Report progress periodically (every ~1 second of audio)
+        if (totalSamplesCollected % (sampleRate * 1) < bufferSize) {
+          chrome.runtime.sendMessage({
+            type: 'AUDIO_CAPTURE_PROGRESS',
+            progress: Math.min(1, totalSamplesCollected / targetSamples),
+            totalSamples: totalSamplesCollected,
+            sampleRate,
+          });
+        }
+
+        // Once we have enough audio, send the full buffer
+        if (totalSamplesCollected >= targetSamples) {
+          sendAccumulatedAudio(sampleRate);
+        }
+      }
+    };
 
     return true;
   } catch (e) {
@@ -81,50 +111,58 @@ function setupAudioCapture(): boolean {
   }
 }
 
-/** Start capturing audio data and sending it to the background */
+/** Merge accumulated chunks and send to background for analysis */
+function sendAccumulatedAudio(sampleRate: number) {
+  const merged = new Float32Array(totalSamplesCollected);
+  let offset = 0;
+  for (const chunk of audioChunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  // Send as regular array (structured clone across extension boundary)
+  chrome.runtime.sendMessage({
+    type: 'AUDIO_BUFFER_READY',
+    data: Array.from(merged),
+    sampleRate,
+  });
+
+  // Reset buffer
+  audioChunks = [];
+  totalSamplesCollected = 0;
+  isCapturing = false;
+}
+
+/** Start capturing audio data */
 function startAudioCapture() {
   if (isCapturing) return;
   if (!setupAudioCapture()) return;
-  if (!analyserNode) return;
 
+  // Reset accumulation
+  audioChunks = [];
+  totalSamplesCollected = 0;
   isCapturing = true;
-  const bufferLength = analyserNode.fftSize;
-  const dataArray = new Float32Array(bufferLength);
-
-  function captureFrame() {
-    if (!isCapturing || !analyserNode) return;
-    analyserNode.getFloatTimeDomainData(dataArray);
-
-    // Send audio data to background
-    chrome.runtime.sendMessage({
-      type: 'AUDIO_DATA',
-      data: Array.from(dataArray),
-    } as any);
-
-    requestAnimationFrame(captureFrame);
-  }
-
-  captureFrame();
 }
 
 /** Stop audio capture */
 function stopAudioCapture() {
   isCapturing = false;
+  audioChunks = [];
+  totalSamplesCollected = 0;
 }
 
-/** Start polling player state and sending updates to background */
+/** Start polling player state at 5Hz */
 function startStatePolling() {
   if (statePollingInterval) return;
 
   statePollingInterval = setInterval(() => {
     const state = getPlayerState();
-    if (state) {
+    if (state && state.type === 'PLAYER_STATE') {
       chrome.runtime.sendMessage(state);
     }
-  }, 100); // 10Hz state updates
+  }, 200); // 5Hz
 }
 
-/** Stop state polling */
 function stopStatePolling() {
   if (statePollingInterval) {
     clearInterval(statePollingInterval);
@@ -162,18 +200,14 @@ chrome.runtime.onMessage.addListener(
 
     switch (message.type) {
       case 'GET_PLAYER_STATE': {
-        const state = getPlayerState();
-        sendResponse(state);
+        sendResponse(getPlayerState());
         return true;
       }
 
       case 'CAPTURE_AUDIO': {
-        const success = setupAudioCapture();
-        if (success) {
-          startAudioCapture();
-          startStatePolling();
-        }
-        sendResponse({ success });
+        startAudioCapture();
+        startStatePolling();
+        sendResponse({ success: true });
         return true;
       }
 
@@ -235,9 +269,17 @@ chrome.runtime.onMessage.addListener(
 
 /** Initialize: wait for video element, then set up */
 function init() {
+  const video = getVideoElement();
+  if (video) {
+    setupVideoEventListeners();
+    startStatePolling();
+    chrome.runtime.sendMessage({ type: 'CONTENT_READY' } as ContentResponse);
+    return;
+  }
+
   const observer = new MutationObserver((_mutations, obs) => {
-    const video = getVideoElement();
-    if (video) {
+    const v = getVideoElement();
+    if (v) {
       obs.disconnect();
       setupVideoEventListeners();
       startStatePolling();
@@ -245,15 +287,7 @@ function init() {
     }
   });
 
-  // Check immediately
-  const video = getVideoElement();
-  if (video) {
-    setupVideoEventListeners();
-    startStatePolling();
-    chrome.runtime.sendMessage({ type: 'CONTENT_READY' } as ContentResponse);
-  } else {
-    observer.observe(document.body, { childList: true, subtree: true });
-  }
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
 init();
