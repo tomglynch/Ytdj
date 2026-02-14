@@ -1,0 +1,16 @@
+# Core (required for all)
+numpy>=1.24
+soundfile>=0.12
+librosa>=0.10
+
+# Python analyzers
+essentia>=2.1b6
+aubio>=0.4.9
+scipy>=1.10
+
+# Phrase analysis (optional)
+# msaf>=0.1.8
+
+# Heavy (optional — uncomment if you want pytorch-based analyzers)
+# beatnet
+# allin1
